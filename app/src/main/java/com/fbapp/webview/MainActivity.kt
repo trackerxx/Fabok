@@ -39,7 +39,12 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
-        webView.webViewClient = WebViewClient()
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String?) {
+                super.onPageFinished(view, url)
+                view.evaluateJavascript(HIDE_OPEN_APP_JS, null)
+            }
+        }
 
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState)
@@ -74,5 +79,65 @@ class MainActivity : AppCompatActivity() {
         } else {
             super.onBackPressed()
         }
+    }
+
+    companion object {
+        // Continuously watches the page for "Open app" buttons (Facebook's
+        // own native-app install prompts) and hides them as they appear,
+        // including ones added later while scrolling. Matches by visible
+        // text/aria-label instead of CSS class names, since Facebook's
+        // class names change often but the button's text stays the same.
+        private const val HIDE_OPEN_APP_JS = """
+            (function() {
+                if (window.__openAppHiderInstalled) return;
+                window.__openAppHiderInstalled = true;
+
+                function isOpenAppButton(el) {
+                    if (!el || el.nodeType !== 1) return false;
+                    var label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    var text = (el.textContent || '').trim().toLowerCase();
+                    return label === 'open app' || text === 'open app';
+                }
+
+                function hideIfMatch(el) {
+                    if (!el || el.nodeType !== 1) return;
+                    if (isOpenAppButton(el)) {
+                        // Hide the closest reasonably-sized container so the
+                        // whole banner/button area disappears, not just text.
+                        var target = el;
+                        for (var i = 0; i < 4 && target.parentElement; i++) {
+                            target = target.parentElement;
+                        }
+                        target.style.setProperty('display', 'none', 'important');
+                    }
+                }
+
+                function scan(root) {
+                    try {
+                        if (isOpenAppButton(root)) {
+                            hideIfMatch(root);
+                            return;
+                        }
+                        var all = root.querySelectorAll('div,a,span,button');
+                        for (var i = 0; i < all.length; i++) {
+                            hideIfMatch(all[i]);
+                        }
+                    } catch (e) {}
+                }
+
+                scan(document.body);
+
+                var observer = new MutationObserver(function(mutations) {
+                    for (var i = 0; i < mutations.length; i++) {
+                        var added = mutations[i].addedNodes;
+                        for (var j = 0; j < added.length; j++) {
+                            scan(added[j]);
+                        }
+                    }
+                });
+
+                observer.observe(document.body, { childList: true, subtree: true });
+            })();
+        """
     }
 }
