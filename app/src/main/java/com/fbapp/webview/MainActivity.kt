@@ -11,6 +11,9 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.CookieManager
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 
 class MainActivity : AppCompatActivity() {
 
@@ -20,8 +23,19 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Let our content draw behind the status bar area instead of
+        // leaving a black gap where the status bar used to be.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
         webView = WebView(this)
         setContentView(webView)
+
+        // Ignore the system bar insets so the WebView fills the entire
+        // screen (including the area behind the status bar).
+        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
+            view.setPadding(0, 0, 0, 0)
+            WindowInsetsCompat.CONSUMED
+        }
 
         hideSystemBars()
 
@@ -40,31 +54,7 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView, url: String?) {
-                super.onPageFinished(view, url)
-                // Try to hide "Open app" style ad install banners.
-                // Facebook changes its class/attribute names often, so this
-                // is a best-effort attempt and may not always work.
-                val hideAdButtonsJs = """
-                    (function() {
-                        try {
-                            var style = document.createElement('style');
-                            style.innerHTML = `
-                                div[aria-label="Open app"],
-                                a[aria-label="Open app"],
-                                div[data-testid*="cta"],
-                                div[role="button"][aria-label="Open app"] {
-                                    display: none !important;
-                                }
-                            `;
-                            document.head.appendChild(style);
-                        } catch (e) {}
-                    })();
-                """.trimIndent()
-                view.evaluateJavascript(hideAdButtonsJs, null)
-            }
-        }
+        webView.webViewClient = WebViewClient()
 
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState)
