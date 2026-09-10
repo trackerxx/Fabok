@@ -27,12 +27,9 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
-import android.content.res.Configuration
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 
 class MainActivity : AppCompatActivity() {
 
@@ -40,6 +37,9 @@ class MainActivity : AppCompatActivity() {
     private val storagePermissionCode = 100
     private val fileChooserRequestCode = 200
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+
+    // Buffers base64 chunks sent from JS while a blob download is in progress, keyed by sessionId.
+    private val chunkBuffers = HashMap<String, StringBuilder>()
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,8 +66,8 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
-        // Bridge so JS can hand blob: image/video data back to Android for saving.
-        webView.addJavascriptInterface(BlobSaveInterface(), "AndroidSave")
+        // Bridge so JS can hand blob image/video data back to Android for saving.
+        webView.addJavascriptInterface(AndroidSaveBridge(), "AndroidSave")
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String?) {
@@ -110,30 +110,18 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Handles Facebook's own "Save" button on photos/videos.
         webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
             if (url.startsWith("blob:")) {
                 // DownloadManager can't fetch blob: URLs directly (they only live in page memory).
-                // Read the blob back inside the page via JS and hand the bytes to Android as base64.
+                // Read the blob back inside the page via JS, in small chunks, and hand it to Android.
                 val fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)
-                val js = """
-                    (function() {
-                        var xhr = new XMLHttpRequest();
-                        xhr.open('GET', '$url', true);
-                        xhr.responseType = 'blob';
-                        xhr.onload = function() {
-                            var reader = new FileReader();
-                            reader.onloadend = function() {
-                                AndroidSave.saveBase64('$fileName', reader.result);
-                            };
-                            reader.readAsDataURL(xhr.response);
-                        };
-                        xhr.send();
-                    })();
-                """.trimIndent()
+                val js = buildBlobFetchJs(url, fileName)
                 webView.evaluateJavascript(js, null)
                 Toast.makeText(this, "Save hocche...", Toast.LENGTH_SHORT).show()
                 return@setDownloadListener
             }
+            // Plain http/https download link (e.g. a direct video URL).
             try {
                 val request = DownloadManager.Request(Uri.parse(url))
                 request.setMimeType(
@@ -156,27 +144,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Long-press on any post image -> offer to save it straight to the phone's Gallery.
-        webView.setOnLongClickListener {
-            val result = webView.hitTestResult
-            val imageUrl = when (result.type) {
-                WebView.HitTestResult.IMAGE_TYPE,
-                WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE -> result.extra
-                else -> null
-            }
-            if (imageUrl != null) {
-                android.app.AlertDialog.Builder(this)
-                    .setTitle("Save Image")
-                    .setMessage("Ei chobi ta gallery te save korte chan?")
-                    .setPositiveButton("Save") { _, _ -> saveImageToGallery(imageUrl) }
-                    .setNegativeButton("Cancel", null)
-                    .show()
-                true
-            } else {
-                false
-            }
-        }
-
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState)
         } else {
@@ -184,39 +151,51 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun saveImageToGallery(imageUrl: String) {
-        Toast.makeText(this, "Save hocche...", Toast.LENGTH_SHORT).show()
-        Thread {
-            try {
-                val connection = URL(imageUrl).openConnection() as HttpURLConnection
-                val cookie = CookieManager.getInstance().getCookie(imageUrl)
-                if (cookie != null) {
-                    connection.setRequestProperty("Cookie", cookie)
-                }
-                connection.connect()
-                val bytes = connection.inputStream.use { it.readBytes() }
-                connection.disconnect()
-
-                val fileName = "FB_${System.currentTimeMillis()}.jpg"
-                saveBytesToGallery(bytes, fileName, "image/jpeg")
-            } catch (e: Exception) {
-                runOnUiThread {
-                    Toast.makeText(this, "Save byartho: ${e.message}", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }.start()
+    /** JS that fetches a blob: URL and streams it to Android as base64 chunks (avoids the Binder size limit). */
+    private fun buildBlobFetchJs(url: String, fileName: String): String {
+        return """
+            (function() {
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', '$url', true);
+                xhr.responseType = 'blob';
+                xhr.onload = function() {
+                    var reader = new FileReader();
+                    reader.onloadend = function() {
+                        var dataUrl = reader.result;
+                        var commaIndex = dataUrl.indexOf(',');
+                        var meta = dataUrl.substring(0, commaIndex);
+                        var base64 = dataUrl.substring(commaIndex + 1);
+                        var chunkSize = 300000;
+                        var sessionId = 's' + Date.now();
+                        for (var i = 0; i < base64.length; i += chunkSize) {
+                            AndroidSave.saveChunk(sessionId, base64.substring(i, i + chunkSize));
+                        }
+                        AndroidSave.finishSave(sessionId, '$fileName', meta);
+                    };
+                    reader.readAsDataURL(xhr.response);
+                };
+                xhr.onerror = function() { AndroidSave.onError('blob fetch failed'); };
+                xhr.send();
+            })();
+        """.trimIndent()
     }
 
-    /** Called from JS when the page hands us a blob (Facebook's own "Save" button) as base64. */
-    inner class BlobSaveInterface {
+    /** Bridge exposed to JS: chunked transfer of the blob data behind Facebook's "Save" button. */
+    inner class AndroidSaveBridge {
         @JavascriptInterface
-        fun saveBase64(suggestedName: String, dataUrl: String) {
+        fun saveChunk(sessionId: String, chunk: String) {
+            synchronized(chunkBuffers) {
+                chunkBuffers.getOrPut(sessionId) { StringBuilder() }.append(chunk)
+            }
+        }
+
+        @JavascriptInterface
+        fun finishSave(sessionId: String, suggestedName: String, meta: String) {
             Thread {
                 try {
-                    // dataUrl looks like "data:image/jpeg;base64,....." — strip the prefix.
-                    val commaIndex = dataUrl.indexOf(',')
-                    val meta = dataUrl.substring(0, commaIndex)
-                    val base64Part = dataUrl.substring(commaIndex + 1)
+                    val base64Part = synchronized(chunkBuffers) {
+                        chunkBuffers.remove(sessionId)?.toString()
+                    } ?: throw Exception("No data received")
                     val bytes = Base64.decode(base64Part, Base64.DEFAULT)
 
                     val isVideo = meta.contains("video")
@@ -232,6 +211,13 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }.start()
+        }
+
+        @JavascriptInterface
+        fun onError(message: String) {
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Save byartho: $message", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
