@@ -67,14 +67,19 @@ class MainActivity : AppCompatActivity() {
                 filePathCallback?.onReceiveValue(null)
                 filePathCallback = callback
 
-                val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                // Always offer both images and videos, regardless of what the page asked for.
+                val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
                     type = "*/*"
+                    putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    if (fileChooserParams?.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    }
                 }
-                intent.addCategory(Intent.CATEGORY_OPENABLE)
 
                 try {
                     startActivityForResult(
-                        Intent.createChooser(intent, "Select File"),
+                        Intent.createChooser(intent, "Select Photo or Video"),
                         fileChooserRequestCode
                     )
                 } catch (e: Exception) {
