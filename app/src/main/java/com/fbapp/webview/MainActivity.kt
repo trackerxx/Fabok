@@ -1,4 +1,4 @@
-package com.igapp.webview
+package com.fbapp.webview
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -7,26 +7,25 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.media.AudioManager
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
-import android.webkit.CookieManager
-import android.webkit.PermissionRequest
-import android.webkit.URLUtil
+import android.webkit.MimeTypeMap
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.CookieManager
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.getSystemService
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import android.content.res.Configuration
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
@@ -35,37 +34,16 @@ import java.net.URL
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
-
-    // Holds the WebView's callback while the system file picker is open (for uploads)
+    private val storagePermissionCode = 100
+    private val fileChooserRequestCode = 200
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
-
-    private val fileChooserLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val data = result.data
-        val uris: Array<Uri>? = when {
-            result.resultCode != RESULT_OK || data == null -> null
-            data.clipData != null -> {
-                val clip = data.clipData!!
-                Array(clip.itemCount) { i -> clip.getItemAt(i).uri }
-            }
-            data.data != null -> arrayOf(data.data!!)
-            else -> null
-        }
-        filePathCallback?.onReceiveValue(uris)
-        filePathCallback = null
-    }
-
-    private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* if denied, the relevant action (upload/download/mic) just won't work until retried */ }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         applyStatusBarColor()
-        requestNeededPermissions()
+        requestStoragePermissionIfNeeded()
 
         webView = WebView(this)
         setContentView(webView)
@@ -80,11 +58,6 @@ class MainActivity : AppCompatActivity() {
         settings.builtInZoomControls = true
         settings.displayZoomControls = false
         settings.cacheMode = WebSettings.LOAD_DEFAULT
-        settings.allowFileAccess = true
-        settings.mediaPlaybackRequiresUserGesture = false
-
-        // Some devices need audio mode explicitly reset to NORMAL for WebView mic capture to work
-        (getSystemService(AUDIO_SERVICE) as? AudioManager)?.mode = AudioManager.MODE_NORMAL
 
         // Keep login sessions saved
         CookieManager.getInstance().setAcceptCookie(true)
@@ -93,70 +66,68 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
-                view.evaluateJavascript(HIDE_OPEN_APP_JS, null)
+                // Commit the login/session cookie to disk so it survives a background process kill.
+                CookieManager.getInstance().flush()
             }
         }
 
-        // Lets the upload/attach button inside instagram.com open the system file picker
         webView.webChromeClient = object : WebChromeClient() {
             override fun onShowFileChooser(
-                view: WebView?,
+                webView: WebView?,
                 callback: ValueCallback<Array<Uri>>?,
                 fileChooserParams: FileChooserParams?
             ): Boolean {
                 filePathCallback?.onReceiveValue(null)
                 filePathCallback = callback
 
+                // Always offer both images and videos, regardless of what the page asked for.
                 val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
                     type = "*/*"
-                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-                }
-                fileChooserLauncher.launch(Intent.createChooser(intent, "Select file"))
-                return true
-            }
-
-            // Grants mic (and camera, if requested) access for voice notes / calls,
-            // as long as the matching Android runtime permission has already been granted.
-            override fun onPermissionRequest(request: PermissionRequest?) {
-                request ?: return
-                val granted = request.resources.filter { resource ->
-                    when (resource) {
-                        PermissionRequest.RESOURCE_AUDIO_CAPTURE ->
-                            checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-                        PermissionRequest.RESOURCE_VIDEO_CAPTURE ->
-                            checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-                        else -> false
+                    putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    if (fileChooserParams?.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
                     }
                 }
-                if (granted.isNotEmpty()) {
-                    runOnUiThread { request.grant(granted.toTypedArray()) }
-                } else {
-                    runOnUiThread { request.deny() }
+
+                try {
+                    startActivityForResult(
+                        Intent.createChooser(intent, "Select Photo or Video"),
+                        fileChooserRequestCode
+                    )
+                } catch (e: Exception) {
+                    filePathCallback = null
+                    Toast.makeText(this@MainActivity, "File chooser open kora jai ni", Toast.LENGTH_SHORT).show()
+                    return false
                 }
+                return true
             }
         }
 
-        // Handles files that Instagram pushes out for download (photos, videos, reels, etc.)
         webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
             try {
-                val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
-                val cookie = CookieManager.getInstance().getCookie(url) ?: ""
+                val request = DownloadManager.Request(Uri.parse(url))
+                request.setMimeType(
+                    mimeType ?: MimeTypeMap.getSingleton()
+                        .getMimeTypeFromExtension(MimeTypeMap.getFileExtensionFromUrl(url))
+                )
+                val cookie = CookieManager.getInstance().getCookie(url)
+                request.addRequestHeader("cookie", cookie)
+                request.setNotificationVisibility(
+                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+                )
+                val fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)
+                request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
 
-                val request = DownloadManager.Request(Uri.parse(url)).apply {
-                    addRequestHeader("cookie", cookie)
-                    setMimeType(mimeType)
-                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-                }
-
-                getSystemService<DownloadManager>()?.enqueue(request)
-                Toast.makeText(this, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+                val downloadManager = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
+                downloadManager.enqueue(request)
+                Toast.makeText(this, "ডাউনলোড শুরু হয়েছে...", Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
-                Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "ডাউনলোড ব্যর্থ হয়েছে: ${e.message}", Toast.LENGTH_SHORT).show()
             }
         }
 
-        // Long-press on any post/story image -> offer to save it straight to the phone's Gallery.
+        // Long-press on any post image -> offer to save it straight to the phone's Gallery.
         webView.setOnLongClickListener {
             val result = webView.hitTestResult
             val imageUrl = when (result.type) {
@@ -167,7 +138,7 @@ class MainActivity : AppCompatActivity() {
             if (imageUrl != null) {
                 android.app.AlertDialog.Builder(this)
                     .setTitle("Save Image")
-                    .setMessage("Save this photo to your Gallery?")
+                    .setMessage("Ei chobi ta gallery te save korte chan?")
                     .setPositiveButton("Save") { _, _ -> saveImageToGallery(imageUrl) }
                     .setNegativeButton("Cancel", null)
                     .show()
@@ -180,13 +151,12 @@ class MainActivity : AppCompatActivity() {
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState)
         } else {
-            webView.loadUrl("https://www.instagram.com")
+            webView.loadUrl("https://m.facebook.com")
         }
     }
 
-    /** Downloads the given image URL in the background and writes it into the device Gallery. */
     private fun saveImageToGallery(imageUrl: String) {
-        Toast.makeText(this, "Saving...", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "Save hocche...", Toast.LENGTH_SHORT).show()
         Thread {
             try {
                 val connection = URL(imageUrl).openConnection() as HttpURLConnection
@@ -197,7 +167,7 @@ class MainActivity : AppCompatActivity() {
                 connection.connect()
                 val inputStream = connection.inputStream
 
-                val fileName = "IG_${System.currentTimeMillis()}.jpg"
+                val fileName = "FB_${System.currentTimeMillis()}.jpg"
                 var saved = false
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -231,54 +201,64 @@ class MainActivity : AppCompatActivity() {
 
                 runOnUiThread {
                     if (saved) {
-                        Toast.makeText(this, "Saved to Gallery", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this, "Chobi Gallery-te save hoyeche", Toast.LENGTH_SHORT).show()
                     } else {
-                        Toast.makeText(this, "Could not save image", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this, "Save kora jai ni", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
                 runOnUiThread {
-                    Toast.makeText(this, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Save byartho: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
             }
         }.start()
     }
 
-    /** Asks for the storage/media/mic permissions needed for upload, download & voice notes. */
-    private fun requestNeededPermissions() {
-        val needed = mutableListOf<String>()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            needed += Manifest.permission.READ_MEDIA_IMAGES
-            needed += Manifest.permission.READ_MEDIA_VIDEO
-            needed += Manifest.permission.READ_MEDIA_AUDIO
-        } else {
-            needed += Manifest.permission.READ_EXTERNAL_STORAGE
-            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                needed += Manifest.permission.WRITE_EXTERNAL_STORAGE
+    private fun requestStoragePermissionIfNeeded() {
+        // API 29+ (Android 10+) doesn't need this permission for public Downloads folder access.
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            val permission = Manifest.permission.WRITE_EXTERNAL_STORAGE
+            if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(permission), storagePermissionCode)
             }
-        }
-        needed += Manifest.permission.RECORD_AUDIO
-
-        val notGranted = needed.filter {
-            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (notGranted.isNotEmpty()) {
-            permissionLauncher.launch(notGranted.toTypedArray())
         }
     }
 
     private fun applyStatusBarColor() {
-        val barColor = Color.parseColor("#0C1014")
+        val color = Color.parseColor("#242424")
 
-        window.statusBarColor = barColor
-        window.navigationBarColor = barColor
+        window.statusBarColor = color
+        window.navigationBarColor = color
 
         WindowCompat.getInsetsController(window, window.decorView).apply {
             isAppearanceLightStatusBars = false
             isAppearanceLightNavigationBars = false
         }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == fileChooserRequestCode) {
+            var results: Array<Uri>? = null
+            if (resultCode == RESULT_OK && data != null) {
+                val dataUri = data.data
+                val clipData = data.clipData
+                if (clipData != null) {
+                    results = Array(clipData.itemCount) { i -> clipData.getItemAt(i).uri }
+                } else if (dataUri != null) {
+                    results = arrayOf(dataUri)
+                }
+            }
+            filePathCallback?.onReceiveValue(results)
+            filePathCallback = null
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // Facebook uses this login session; commit it before we background for the file picker.
+        CookieManager.getInstance().flush()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -292,68 +272,5 @@ class MainActivity : AppCompatActivity() {
         } else {
             super.onBackPressed()
         }
-    }
-
-    companion object {
-        // Continuously watches the page for "Open app" / "Get the app"
-        // style native-app install prompts and hides them as they appear,
-        // including ones added later while scrolling. Matches by visible
-        // text/aria-label instead of CSS class names, since Instagram's
-        // class names change often but the button's text stays similar.
-        private const val HIDE_OPEN_APP_JS = """
-            (function() {
-                if (window.__openAppHiderInstalled) return;
-                window.__openAppHiderInstalled = true;
-
-                var phrases = ['open app', 'get the app', 'open in app', 'install app'];
-
-                function isOpenAppButton(el) {
-                    if (!el || el.nodeType !== 1) return false;
-                    var label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
-                    var text = (el.textContent || '').trim().toLowerCase();
-                    for (var i = 0; i < phrases.length; i++) {
-                        if (label === phrases[i] || text === phrases[i]) return true;
-                    }
-                    return false;
-                }
-
-                function hideIfMatch(el) {
-                    if (!el || el.nodeType !== 1) return;
-                    if (isOpenAppButton(el)) {
-                        var target = el;
-                        for (var i = 0; i < 4 && target.parentElement; i++) {
-                            target = target.parentElement;
-                        }
-                        target.style.setProperty('display', 'none', 'important');
-                    }
-                }
-
-                function scan(root) {
-                    try {
-                        if (isOpenAppButton(root)) {
-                            hideIfMatch(root);
-                            return;
-                        }
-                        var all = root.querySelectorAll('div,a,span,button');
-                        for (var i = 0; i < all.length; i++) {
-                            hideIfMatch(all[i]);
-                        }
-                    } catch (e) {}
-                }
-
-                scan(document.body);
-
-                var observer = new MutationObserver(function(mutations) {
-                    for (var i = 0; i < mutations.length; i++) {
-                        var added = mutations[i].addedNodes;
-                        for (var j = 0; j < added.length; j++) {
-                            scan(added[j]);
-                        }
-                    }
-                });
-
-                observer.observe(document.body, { childList: true, subtree: true });
-            })();
-        """
     }
 }
