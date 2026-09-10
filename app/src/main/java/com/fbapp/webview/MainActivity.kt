@@ -3,6 +3,7 @@ package com.fbapp.webview
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
@@ -10,6 +11,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.webkit.MimeTypeMap
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -25,6 +28,8 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private val storagePermissionCode = 100
+    private val fileChooserRequestCode = 200
+    private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,6 +57,34 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
         webView.webViewClient = WebViewClient()
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                callback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                filePathCallback?.onReceiveValue(null)
+                filePathCallback = callback
+
+                val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                    type = "*/*"
+                }
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+
+                try {
+                    startActivityForResult(
+                        Intent.createChooser(intent, "Select File"),
+                        fileChooserRequestCode
+                    )
+                } catch (e: Exception) {
+                    filePathCallback = null
+                    Toast.makeText(this@MainActivity, "File chooser open kora jai ni", Toast.LENGTH_SHORT).show()
+                    return false
+                }
+                return true
+            }
+        }
 
         webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
             try {
@@ -103,6 +136,25 @@ class MainActivity : AppCompatActivity() {
             isAppearanceLightStatusBars = false
             isAppearanceLightNavigationBars = false
         }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == fileChooserRequestCode) {
+            var results: Array<Uri>? = null
+            if (resultCode == RESULT_OK && data != null) {
+                val dataUri = data.data
+                val clipData = data.clipData
+                if (clipData != null) {
+                    results = Array(clipData.itemCount) { i -> clipData.getItemAt(i).uri }
+                } else if (dataUri != null) {
+                    results = arrayOf(dataUri)
+                }
+            }
+            filePathCallback?.onReceiveValue(results)
+            filePathCallback = null
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
