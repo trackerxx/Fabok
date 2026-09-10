@@ -13,6 +13,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Base64
+import android.webkit.JavascriptInterface
 import android.webkit.MimeTypeMap
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -26,6 +28,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import android.content.res.Configuration
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
@@ -62,6 +65,9 @@ class MainActivity : AppCompatActivity() {
         // Keep login sessions saved
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+
+        // Bridge so JS can hand blob: image/video data back to Android for saving.
+        webView.addJavascriptInterface(BlobSaveInterface(), "AndroidSave")
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String?) {
@@ -105,6 +111,29 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+            if (url.startsWith("blob:")) {
+                // DownloadManager can't fetch blob: URLs directly (they only live in page memory).
+                // Read the blob back inside the page via JS and hand the bytes to Android as base64.
+                val fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)
+                val js = """
+                    (function() {
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('GET', '$url', true);
+                        xhr.responseType = 'blob';
+                        xhr.onload = function() {
+                            var reader = new FileReader();
+                            reader.onloadend = function() {
+                                AndroidSave.saveBase64('$fileName', reader.result);
+                            };
+                            reader.readAsDataURL(xhr.response);
+                        };
+                        xhr.send();
+                    })();
+                """.trimIndent()
+                webView.evaluateJavascript(js, null)
+                Toast.makeText(this, "Save hocche...", Toast.LENGTH_SHORT).show()
+                return@setDownloadListener
+            }
             try {
                 val request = DownloadManager.Request(Uri.parse(url))
                 request.setMimeType(
@@ -165,53 +194,88 @@ class MainActivity : AppCompatActivity() {
                     connection.setRequestProperty("Cookie", cookie)
                 }
                 connection.connect()
-                val inputStream = connection.inputStream
-
-                val fileName = "FB_${System.currentTimeMillis()}.jpg"
-                var saved = false
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    // Android 10+: write via MediaStore, no storage permission needed.
-                    val contentValues = ContentValues().apply {
-                        put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES)
-                    }
-                    val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-                    if (uri != null) {
-                        contentResolver.openOutputStream(uri)?.use { out ->
-                            inputStream.copyTo(out)
-                        }
-                        saved = true
-                    }
-                } else {
-                    // Older Android: write directly into the public Pictures folder, then scan it.
-                    val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
-                    if (!picturesDir.exists()) picturesDir.mkdirs()
-                    val file = File(picturesDir, fileName)
-                    FileOutputStream(file).use { out ->
-                        inputStream.copyTo(out)
-                    }
-                    MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), null, null)
-                    saved = true
-                }
-
-                inputStream.close()
+                val bytes = connection.inputStream.use { it.readBytes() }
                 connection.disconnect()
 
-                runOnUiThread {
-                    if (saved) {
-                        Toast.makeText(this, "Chobi Gallery-te save hoyeche", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Toast.makeText(this, "Save kora jai ni", Toast.LENGTH_SHORT).show()
-                    }
-                }
+                val fileName = "FB_${System.currentTimeMillis()}.jpg"
+                saveBytesToGallery(bytes, fileName, "image/jpeg")
             } catch (e: Exception) {
                 runOnUiThread {
                     Toast.makeText(this, "Save byartho: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
             }
         }.start()
+    }
+
+    /** Called from JS when the page hands us a blob (Facebook's own "Save" button) as base64. */
+    inner class BlobSaveInterface {
+        @JavascriptInterface
+        fun saveBase64(suggestedName: String, dataUrl: String) {
+            Thread {
+                try {
+                    // dataUrl looks like "data:image/jpeg;base64,....." — strip the prefix.
+                    val commaIndex = dataUrl.indexOf(',')
+                    val meta = dataUrl.substring(0, commaIndex)
+                    val base64Part = dataUrl.substring(commaIndex + 1)
+                    val bytes = Base64.decode(base64Part, Base64.DEFAULT)
+
+                    val isVideo = meta.contains("video")
+                    val mimeType = if (isVideo) "video/mp4" else "image/jpeg"
+                    val extension = if (isVideo) "mp4" else "jpg"
+                    val fileName = if (suggestedName.contains(".")) suggestedName
+                        else "FB_${System.currentTimeMillis()}.$extension"
+
+                    saveBytesToGallery(bytes, fileName, mimeType)
+                } catch (e: Exception) {
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Save byartho: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }.start()
+        }
+    }
+
+    /** Writes raw bytes into the device Gallery (Pictures for images, Movies for video). */
+    private fun saveBytesToGallery(bytes: ByteArray, fileName: String, mimeType: String) {
+        val isVideo = mimeType.startsWith("video")
+        val relativeDir = if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
+        var saved = false
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Android 10+: write via MediaStore, no storage permission needed.
+            val collection = if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            val contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDir)
+            }
+            val uri = contentResolver.insert(collection, contentValues)
+            if (uri != null) {
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    ByteArrayInputStream(bytes).copyTo(out)
+                }
+                saved = true
+            }
+        } else {
+            // Older Android: write directly into the public folder, then scan it.
+            val dir = Environment.getExternalStoragePublicDirectory(relativeDir)
+            if (!dir.exists()) dir.mkdirs()
+            val file = File(dir, fileName)
+            FileOutputStream(file).use { out ->
+                ByteArrayInputStream(bytes).copyTo(out)
+            }
+            MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), null, null)
+            saved = true
+        }
+
+        runOnUiThread {
+            if (saved) {
+                Toast.makeText(this, "Gallery-te save hoyeche", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Save kora jai ni", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun requestStoragePermissionIfNeeded() {
