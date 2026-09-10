@@ -2,6 +2,7 @@ package com.fbapp.webview
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.app.DownloadManager
 import android.content.ContentValues
 import android.content.Intent
@@ -30,6 +31,8 @@ import androidx.core.view.WindowCompat
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : AppCompatActivity() {
 
@@ -74,6 +77,8 @@ class MainActivity : AppCompatActivity() {
                 super.onPageFinished(view, url)
                 // Commit the login/session cookie to disk so it survives a background process kill.
                 CookieManager.getInstance().flush()
+                // DOM-based long-press image detection (bypasses Facebook's invisible click-layer overlay).
+                view.evaluateJavascript(longPressDetectionJs, null)
             }
         }
 
@@ -180,8 +185,85 @@ class MainActivity : AppCompatActivity() {
         """.trimIndent()
     }
 
+    /**
+     * Injected on every onPageFinished. Listens for a long-press directly in the page's own DOM
+     * and walks up from the touched element to find the nearest <img src> or CSS background-image.
+     * Facebook's invisible click-layer sits on top of the real <img>, so Android's own
+     * getHitTestResult()/touch-detection often grabs the overlay instead of the image — reading the
+     * DOM from inside the page itself is what actually sees the real element underneath.
+     * Guarded with a window flag so re-injection on subsequent onPageFinished calls is a no-op.
+     */
+    private val longPressDetectionJs = """
+        (function() {
+            if (window.__androidLongPressInstalled) return;
+            window.__androidLongPressInstalled = true;
+
+            var pressTimer = null;
+            var startX = 0, startY = 0;
+            var MOVE_THRESHOLD = 12;
+            var LONG_PRESS_MS = 450;
+
+            function findImageUrl(el) {
+                var node = el;
+                var depth = 0;
+                while (node && depth < 6) {
+                    if (node.tagName === 'IMG' && node.src) {
+                        return node.src;
+                    }
+                    var bg = window.getComputedStyle(node).backgroundImage;
+                    if (bg && bg !== 'none') {
+                        var match = bg.match(/url\(["']?(.*?)["']?\)/);
+                        if (match && match[1]) return match[1];
+                    }
+                    node = node.parentElement;
+                    depth++;
+                }
+                return null;
+            }
+
+            function clearTimer() {
+                if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+            }
+
+            document.addEventListener('touchstart', function(e) {
+                if (e.touches.length !== 1) { clearTimer(); return; }
+                var touch = e.touches[0];
+                startX = touch.clientX;
+                startY = touch.clientY;
+                var target = e.target;
+                clearTimer();
+                pressTimer = setTimeout(function() {
+                    pressTimer = null;
+                    var url = findImageUrl(target);
+                    if (url) {
+                        try { AndroidSave.onImageLongPress(url); } catch (err) {}
+                    }
+                }, LONG_PRESS_MS);
+            }, { passive: true });
+
+            document.addEventListener('touchmove', function(e) {
+                if (!pressTimer) return;
+                var touch = e.touches[0];
+                if (Math.abs(touch.clientX - startX) > MOVE_THRESHOLD ||
+                    Math.abs(touch.clientY - startY) > MOVE_THRESHOLD) {
+                    clearTimer();
+                }
+            }, { passive: true });
+
+            document.addEventListener('touchend', clearTimer, { passive: true });
+            document.addEventListener('touchcancel', clearTimer, { passive: true });
+        })();
+    """.trimIndent()
+
     /** Bridge exposed to JS: chunked transfer of the blob data behind Facebook's "Save" button. */
     inner class AndroidSaveBridge {
+        @JavascriptInterface
+        fun onImageLongPress(url: String) {
+            runOnUiThread {
+                showSaveImageDialog(url)
+            }
+        }
+
         @JavascriptInterface
         fun saveChunk(sessionId: String, chunk: String) {
             synchronized(chunkBuffers) {
@@ -262,6 +344,56 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Save kora jai ni", Toast.LENGTH_SHORT).show()
             }
         }
+    }
+
+    /** Small confirmation so a long scroll-press doesn't accidentally trigger a save. */
+    private fun showSaveImageDialog(url: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Save Image")
+            .setMessage("Ei image ta gallery-te save korte chao?")
+            .setPositiveButton("Save") { _, _ -> downloadImageDirect(url) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /**
+     * Fetches the exact DOM-resolved image URL directly (with the FB session cookie attached,
+     * in case it's a private/CDN-signed asset) and writes it straight into the gallery — no
+     * dependency on Facebook's own blob-based "Save" button.
+     */
+    private fun downloadImageDirect(url: String) {
+        Toast.makeText(this, "Save hocche...", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val connection = URL(url).openConnection() as HttpURLConnection
+                val cookie = CookieManager.getInstance().getCookie(url)
+                if (cookie != null) {
+                    connection.setRequestProperty("Cookie", cookie)
+                }
+                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) AppleWebKit/537.36")
+                connection.connect()
+
+                if (connection.responseCode !in 200..299) {
+                    throw Exception("HTTP ${connection.responseCode}")
+                }
+
+                val bytes = connection.inputStream.use { it.readBytes() }
+
+                var mimeType = connection.contentType?.substringBefore(";")?.trim()
+                if (mimeType.isNullOrBlank() || !mimeType.startsWith("image")) {
+                    val guessedExt = MimeTypeMap.getFileExtensionFromUrl(url)
+                    mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(guessedExt) ?: "image/jpeg"
+                }
+                val extension = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType) ?: "jpg"
+                val fileName = "FB_${System.currentTimeMillis()}.$extension"
+
+                saveBytesToGallery(bytes, fileName, mimeType)
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Save byartho: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }.start()
     }
 
     private fun requestStoragePermissionIfNeeded() {
