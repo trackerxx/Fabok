@@ -64,6 +64,13 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        @JavascriptInterface
+        fun reportError(message: String) {
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Save error: $message", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -200,22 +207,67 @@ class MainActivity : AppCompatActivity() {
         val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
 
         if (url.startsWith("blob:")) {
-            // DownloadManager can't fetch blob: URLs itself — pull the bytes out via JS instead.
-            val js = """
+            val isImage = mimeType?.startsWith("image") == true ||
+                fileName.substringAfterLast('.', "").lowercase() in
+                    listOf("jpg", "jpeg", "png", "webp", "gif")
+
+            val js = if (isImage) {
+                // Some pages (e.g. Facebook) set a CSP that blocks XHR/fetch to blob: URLs
+                // (connect-src). Loading it into an <img> and reading it back via <canvas>
+                // is governed by img-src instead, which is usually permitted, so this
+                // sidesteps the CSP block.
+                """
                 (function() {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('GET', '$url', true);
-                    xhr.responseType = 'blob';
-                    xhr.onload = function() {
-                        var reader = new FileReader();
-                        reader.onloadend = function() {
-                            AndroidDownloader.saveBase64File(reader.result, '$fileName');
+                    try {
+                        var img = new Image();
+                        img.onload = function() {
+                            try {
+                                var canvas = document.createElement('canvas');
+                                canvas.width = img.naturalWidth;
+                                canvas.height = img.naturalHeight;
+                                var ctx = canvas.getContext('2d');
+                                ctx.drawImage(img, 0, 0);
+                                var dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+                                AndroidDownloader.saveBase64File(dataUrl, '$fileName');
+                            } catch (e) {
+                                AndroidDownloader.reportError('canvas: ' + e.message);
+                            }
                         };
-                        reader.readAsDataURL(xhr.response);
-                    };
-                    xhr.send();
+                        img.onerror = function() {
+                            AndroidDownloader.reportError('image load failed for blob');
+                        };
+                        img.src = '$url';
+                    } catch (e) {
+                        AndroidDownloader.reportError('img setup: ' + e.message);
+                    }
                 })();
-            """.trimIndent()
+                """.trimIndent()
+            } else {
+                // Non-image blobs (video, documents) - try the direct XHR read.
+                // This can still fail under a strict CSP; reportError will surface why.
+                """
+                (function() {
+                    try {
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('GET', '$url', true);
+                        xhr.responseType = 'blob';
+                        xhr.onload = function() {
+                            var reader = new FileReader();
+                            reader.onloadend = function() {
+                                AndroidDownloader.saveBase64File(reader.result, '$fileName');
+                            };
+                            reader.readAsDataURL(xhr.response);
+                        };
+                        xhr.onerror = function() {
+                            AndroidDownloader.reportError('XHR failed to read blob (possible CSP block)');
+                        };
+                        xhr.send();
+                    } catch (e) {
+                        AndroidDownloader.reportError('xhr setup: ' + e.message);
+                    }
+                })();
+                """.trimIndent()
+            }
             source.evaluateJavascript(js, null)
             return
         }
