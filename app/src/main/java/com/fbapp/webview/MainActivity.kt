@@ -134,6 +134,14 @@ class MainActivity : AppCompatActivity() {
         settings.javaScriptCanOpenWindowsAutomatically = true
         settings.setSupportMultipleWindows(true)
 
+        // Default WebView UA includes "; wv" which marks this as an embedded WebView
+        // rather than a real browser — some Meta/Google security checks (like the
+        // reCAPTCHA "confirm you're human" screen) trigger more aggressively for
+        // that pattern. Presenting a normal Chrome mobile UA reduces that.
+        settings.userAgentString = settings.userAgentString
+            .replace("; wv", "")
+            .replace(Regex("Version/[0-9.]+ "), "")
+
         // Keep login sessions saved
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
@@ -192,6 +200,7 @@ class MainActivity : AppCompatActivity() {
                 val popup = WebView(this@MainActivity)
                 popup.settings.javaScriptEnabled = true
                 popup.settings.domStorageEnabled = true
+                popup.settings.userAgentString = webView.settings.userAgentString
                 popup.addJavascriptInterface(BlobDownloader(), "AndroidDownloader")
 
                 // Reuse the same download handling for anything the popup tries to save.
@@ -213,15 +222,17 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
 
-            // Surfaces JS errors as Toasts so problems are visible without USB/adb debugging.
+            // Logs JS errors to Logcat for debugging, without spamming the user with
+            // Toasts — most console errors on facebook.com are noise from FB's own
+            // scripts (storage access, permissions policy, etc.) and aren't real
+            // app problems.
             override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
                 consoleMessage?.let {
                     if (it.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR) {
-                        Toast.makeText(
-                            this@MainActivity,
-                            "JS error: ${it.message()} (line ${it.lineNumber()})",
-                            Toast.LENGTH_LONG
-                        ).show()
+                        android.util.Log.e(
+                            "WebViewJS",
+                            "${it.message()} (${it.sourceId()}:${it.lineNumber()})"
+                        )
                     }
                 }
                 return true
