@@ -134,14 +134,6 @@ class MainActivity : AppCompatActivity() {
         settings.javaScriptCanOpenWindowsAutomatically = true
         settings.setSupportMultipleWindows(true)
 
-        // Default WebView UA includes "; wv" which marks this as an embedded WebView
-        // rather than a real browser — some Meta/Google security checks (like the
-        // reCAPTCHA "confirm you're human" screen) trigger more aggressively for
-        // that pattern. Presenting a normal Chrome mobile UA reduces that.
-        settings.userAgentString = settings.userAgentString
-            .replace("; wv", "")
-            .replace(Regex("Version/[0-9.]+ "), "")
-
         // Keep login sessions saved
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
@@ -200,7 +192,6 @@ class MainActivity : AppCompatActivity() {
                 val popup = WebView(this@MainActivity)
                 popup.settings.javaScriptEnabled = true
                 popup.settings.domStorageEnabled = true
-                popup.settings.userAgentString = webView.settings.userAgentString
                 popup.addJavascriptInterface(BlobDownloader(), "AndroidDownloader")
 
                 // Reuse the same download handling for anything the popup tries to save.
