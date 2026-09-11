@@ -3,8 +3,12 @@ package com.fbapp.webview
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
@@ -32,6 +36,38 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private val fileChooserRequestCode = 200
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+
+    /**
+     * Notifies the user once a DownloadManager-enqueued file has actually finished
+     * writing to disk (enqueue() only means "queued", not "done"), showing the real
+     * saved file name so it's clear whether it succeeded or failed.
+     */
+    private val downloadCompleteReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            if (id == -1L) return
+
+            val downloadManager = getSystemService<DownloadManager>() ?: return
+            val query = DownloadManager.Query().setFilterById(id)
+            val cursor: Cursor = downloadManager.query(query)
+
+            cursor.use {
+                if (it.moveToFirst()) {
+                    val statusIdx = it.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                    val uriIdx = it.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
+                    val status = if (statusIdx != -1) it.getInt(statusIdx) else -1
+                    val localUri = if (uriIdx != -1) it.getString(uriIdx) else null
+
+                    if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                        val savedName = localUri?.let { uriStr -> Uri.parse(uriStr).lastPathSegment } ?: "file"
+                        Toast.makeText(context, "Downloaded: $savedName", Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(context, "Download failed", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -79,6 +115,8 @@ class MainActivity : AppCompatActivity() {
 
         applyStatusBarColor()
         requestNeededPermissions()
+
+        registerDownloadCompleteReceiver()
 
         webView = WebView(this)
         setContentView(webView)
@@ -286,6 +324,24 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Downloading $fileName", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun registerDownloadCompleteReceiver() {
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(downloadCompleteReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(downloadCompleteReceiver, filter)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            unregisterReceiver(downloadCompleteReceiver)
+        } catch (e: IllegalArgumentException) {
+            // Receiver was already unregistered or never registered; safe to ignore.
         }
     }
 
