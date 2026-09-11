@@ -86,6 +86,8 @@ class MainActivity : AppCompatActivity() {
         settings.builtInZoomControls = true
         settings.displayZoomControls = false
         settings.cacheMode = WebSettings.LOAD_DEFAULT
+        settings.javaScriptCanOpenWindowsAutomatically = true
+        settings.setSupportMultipleWindows(true)
 
         // Keep login sessions saved
         CookieManager.getInstance().setAcceptCookie(true)
@@ -132,54 +134,106 @@ class MainActivity : AppCompatActivity() {
                 }
                 return true
             }
+
+            // Some "Save" flows open a popup (window.open / target="_blank") instead of
+            // navigating the main WebView. Without this, WebView silently blocks the popup
+            // and nothing happens when the button is tapped.
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean {
+                val popup = WebView(this@MainActivity)
+                popup.settings.javaScriptEnabled = true
+                popup.settings.domStorageEnabled = true
+                popup.addJavascriptInterface(BlobDownloader(), "AndroidDownloader")
+
+                // Reuse the same download handling for anything the popup tries to save.
+                popup.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+                    handleDownload(popup, url, contentDisposition, mimeType)
+                }
+
+                // The popup never needs to be shown on screen; it only exists to let the
+                // page's JS run (fetch/blob/save logic) and hand the result back to us.
+                popup.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String?) {
+                        Toast.makeText(this@MainActivity, "Popup loaded: $url", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                transport?.webView = popup
+                resultMsg?.sendToTarget()
+                return true
+            }
+
+            // Surfaces JS errors as Toasts so problems are visible without USB/adb debugging.
+            override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
+                consoleMessage?.let {
+                    if (it.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR) {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "JS error: ${it.message()} (line ${it.lineNumber()})",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+                return true
+            }
         }
 
         // Handles files that the page pushes out for download (media, documents, etc.)
         webView.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
-            val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
-
-            if (url.startsWith("blob:")) {
-                // DownloadManager can't fetch blob: URLs itself — pull the bytes out via JS instead.
-                val js = """
-                    (function() {
-                        var xhr = new XMLHttpRequest();
-                        xhr.open('GET', '$url', true);
-                        xhr.responseType = 'blob';
-                        xhr.onload = function() {
-                            var reader = new FileReader();
-                            reader.onloadend = function() {
-                                AndroidDownloader.saveBase64File(reader.result, '$fileName');
-                            };
-                            reader.readAsDataURL(xhr.response);
-                        };
-                        xhr.send();
-                    })();
-                """.trimIndent()
-                webView.evaluateJavascript(js, null)
-                return@setDownloadListener
-            }
-
-            try {
-                val cookie = CookieManager.getInstance().getCookie(url) ?: ""
-
-                val request = DownloadManager.Request(Uri.parse(url)).apply {
-                    addRequestHeader("cookie", cookie)
-                    setMimeType(mimeType)
-                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-                }
-
-                getSystemService<DownloadManager>()?.enqueue(request)
-                Toast.makeText(this, "Downloading $fileName", Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
-            }
+            handleDownload(webView, url, contentDisposition, mimeType)
         }
 
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState)
         } else {
             webView.loadUrl("https://m.facebook.com")
+        }
+    }
+
+    /** Shared download logic used by both the main WebView and any popup WebView. */
+    private fun handleDownload(source: WebView, url: String, contentDisposition: String?, mimeType: String?) {
+        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+
+        if (url.startsWith("blob:")) {
+            // DownloadManager can't fetch blob: URLs itself — pull the bytes out via JS instead.
+            val js = """
+                (function() {
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('GET', '$url', true);
+                    xhr.responseType = 'blob';
+                    xhr.onload = function() {
+                        var reader = new FileReader();
+                        reader.onloadend = function() {
+                            AndroidDownloader.saveBase64File(reader.result, '$fileName');
+                        };
+                        reader.readAsDataURL(xhr.response);
+                    };
+                    xhr.send();
+                })();
+            """.trimIndent()
+            source.evaluateJavascript(js, null)
+            return
+        }
+
+        try {
+            val cookie = CookieManager.getInstance().getCookie(url) ?: ""
+
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                addRequestHeader("cookie", cookie)
+                setMimeType(mimeType)
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+            }
+
+            getSystemService<DownloadManager>()?.enqueue(request)
+            Toast.makeText(this, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
